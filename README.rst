@@ -2,7 +2,7 @@
  librabbitmq - Python AMQP Client using the rabbitmq-c library.
 ================================================================
 
-:Version: 1.6.0
+:Version: 2.0.0
 :Download: http://pypi.python.org/pypi/librabbitmq/
 :Code: http://github.com/celery/librabbitmq/
 :Keywords: rabbitmq, amqp, messaging, librabbitmq, rabbitmq-c, python,
@@ -86,7 +86,7 @@ Consuming
 ::
 
     >>> def dump_message(message):
-    ...     print("Body:'%s', Proeprties:'%s', DeliveryInfo:'%s'" % (
+    ...     print("Body:'%s', Properties:'%s', DeliveryInfo:'%s'" % (
     ...         message.body, message.properties, message.delivery_info))
     ...     message.ack()
 

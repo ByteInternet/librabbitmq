@@ -1,32 +1,36 @@
 #ifndef __PYLIBRABBIT_CONNECTION_H__
 #define __PYLIBRABBIT_CONNECTION_H__
 
+#define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <structmember.h>
 
 #include <amqp.h>
 #include <amqp_framing.h>
 
-#if PY_VERSION_HEX < 0x02060000 && !defined(Py_SIZE)
-#  define Py_SIZE(ob)     (((PyVarObject*)(ob))->ob_size)
-#endif
-#if PY_VERSION_HEX >= 0x02060000 /* 2.6 and up */
-#  define PY_SSIZE_T_CLEAN
-#  define PY_SIZE_TYPE        Py_ssize_t
-#  define PyLong_FROM_SSIZE_T PyLong_FromSsize_t
-#  define PyLong_AS_SSIZE_T   PyLong_AsSsize_t
-# else                           /* 2.5 and below */
-#  define PY_SIZE_TYPE        unsigned long
-#  define PyLong_FROM_SSIZE_T PyLong_FromUnsignedLong
-#  define PyLong_AS_SSIZE_T   PyLong_AsUnsignedLong
+#if PY_MAJOR_VERSION == 2
+# define TP_FLAGS (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_WEAKREFS)
+#else
+# define TP_FLAGS (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE)
 #endif
 
+#if PY_MAJOR_VERSION >= 3
+    #define PYRABBITMQ_MOD_INIT(name) PyMODINIT_FUNC PyInit_##name(void)
+#else
+    #define PYRABBITMQ_MOD_INIT(name) PyMODINIT_FUNC init##name(void)
+#endif
+
+
 #if PY_VERSION_HEX >= 0x03000000 /* 3.0 and up */
+#  define BUILD_METHOD_NAME PyUnicode_FromString
 #  define FROM_FORMAT PyUnicode_FromFormat
 #  define PyInt_FromLong PyLong_FromLong
+#  define PyInt_AS_LONG PyLong_AsLong
+#  define PyInt_Check PyLong_Check
 #  define PyInt_FromSsize_t PyLong_FromSsize_t
 #  define PyString_INTERN_FROM_STRING PyString_FromString
 #else                            /* 2.x */
+#  define BUILD_METHOD_NAME PyBytes_FromString
 #  define FROM_FORMAT PyString_FromFormat
 #  define PyString_INTERN_FROM_STRING PyString_InternFromString
 #endif
@@ -45,9 +49,24 @@
 # elif defined(__GNUC__) && !defined(__GNUC_STDC_INLINE__)
 #  define _PYRMQ_INLINE extern __inline
 # else
-#  define _PYRMQ_INLINE __inline
+#  define _PYRMQ_INLINE extern __inline
 # endif
 #endif
+
+
+_PYRMQ_INLINE PyObject*
+buffer_toMemoryView(char *buf, Py_ssize_t buf_len) {
+        PyObject *view;
+#if PY_MAJOR_VERSION == 2
+        PyObject *pybuffer;
+        pybuffer = PyBuffer_FromMemory(buf, buf_len);
+        view = PyMemoryView_FromObject(pybuffer);
+        Py_XDECREF(pybuffer);
+#else
+        view = PyMemoryView_FromMemory(buf, buf_len, PyBUF_READ);
+#endif
+        return view;
+}
 
 #define PyDICT_SETNONE_DECREF(dict, key)                            \
     do {                                                            \
@@ -68,8 +87,14 @@
         Py_XDECREF(value);                                          \
     } while(0)
 
-#define PySTRING_FROM_AMQBYTES(member)                              \
-        PyString_FromStringAndSize(member.bytes, member.len);       \
+#if PY_MAJOR_VERSION == 2
+#  define PySTRING_FROM_AMQBYTES(member)                                        \
+        PyString_FromStringAndSize((member).bytes, (Py_ssize_t)(member).len)
+#else
+#  define PySTRING_FROM_AMQBYTES(member)                                        \
+        PyUnicode_FromStringAndSize((member).bytes, (Py_ssize_t)(member).len)
+#endif
+
 
 #define AMQTable_TO_PYKEY(table, i)                                 \
         PySTRING_FROM_AMQBYTES(table->entries[i].key)
@@ -79,11 +104,9 @@
             PySTRING_FROM_AMQBYTES(table->headers.entries[i].key),  \
             stmt);                                                  \
 
-_PYRMQ_INLINE PyObject* Maybe_Unicode(PyObject *);
-
 #if defined(__C99__) || defined(__GNUC__)
 #  define PyString_AS_AMQBYTES(s)                                   \
-      (amqp_bytes_t){Py_SIZE(s), (void *)PyString_AS_STRING(s)}
+      (amqp_bytes_t){Py_SIZE(s), (void *)PyBytes_AS_STRING(s)}
 #else
 _PYRMQ_INLINE amqp_bytes_t PyString_AS_AMQBYTES(PyObject *);
 _PYRMQ_INLINE amqp_bytes_t
@@ -91,19 +114,11 @@ PyString_AS_AMQBYTES(PyObject *s)
 {
     amqp_bytes_t ret;
     ret.len = Py_SIZE(s);
-    ret.bytes = (void *)PyString_AS_STRING(s);
+    ret.bytes = (void *)PyBytes_AS_STRING(s);
     /*{Py_SIZE(s), (void *)PyString_AS_STRING(s)};*/
     return ret;
 }
 #endif
-
-_PYRMQ_INLINE PyObject*
-Maybe_Unicode(PyObject *s)
-{
-    if (PyUnicode_Check(s))
-        return PyUnicode_AsASCIIString(s);
-    return s;
-}
 
 #define PYRMQ_IS_TIMEOUT(t)   (t > 0.0)
 #define PYRMQ_IS_NONBLOCK(t)  (t == -1)
@@ -140,15 +155,12 @@ typedef struct {
     int sockfd;
     int connected;
 
+    PyObject *client_properties;
     PyObject *server_properties;
     PyObject *callbacks;    /* {channel_id: {consumer_tag:callback}} */
 
     PyObject *weakreflist;
 } PyRabbitMQ_Connection;
-
-int
-PyDict_to_basic_properties(PyObject *, amqp_basic_properties_t *,
-                           amqp_connection_state_t, amqp_pool_t *);
 
 /* Connection method sigs */
 static PyRabbitMQ_Connection*
@@ -336,8 +348,7 @@ static PyTypeObject PyRabbitMQ_ConnectionType = {
     /* tp_getattro       */ 0,
     /* tp_setattro       */ 0,
     /* tp_as_buffer      */ 0,
-    /* tp_flags          */ Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE |
-                            Py_TPFLAGS_HAVE_WEAKREFS,
+    /* tp_flags          */ TP_FLAGS,
     /* tp_doc            */ PyRabbitMQ_ConnectionType_doc,
     /* tp_traverse       */ 0,
     /* tp_clear          */ 0,

@@ -15,6 +15,9 @@
 #define PYRABBITMQ_CONNECTION_ERROR 0x10
 #define PYRABBITMQ_CHANNEL_ERROR 0x20
 
+#define PYRABBITMQ_MODULE_NAME "_librabbitmq"
+#define PYRABBITMQ_MODULE_DESC "Hand-made wrapper for librabbitmq."
+
 /* ------: Private Prototypes :------------------------------------------- */
 PyMODINIT_FUNC init_librabbitmq(void);
 
@@ -37,6 +40,9 @@ AMQTable_SetArrayValue(amqp_table_t*, amqp_bytes_t, amqp_array_t);
 
 _PYRMQ_INLINE void
 AMQTable_SetStringValue(amqp_table_t*, amqp_bytes_t, amqp_bytes_t);
+
+_PYRMQ_INLINE void
+AMQTable_SetBoolValue(amqp_table_t*, amqp_bytes_t, int);
 
 _PYRMQ_INLINE void
 AMQTable_SetIntValue(amqp_table_t *, amqp_bytes_t, int);
@@ -72,11 +78,27 @@ _PYRMQ_INLINE int RabbitMQ_wait_timeout(int, double);
 _PYRMQ_INLINE void
 basic_properties_to_PyDict(amqp_basic_properties_t*, PyObject*);
 
-_PYRMQ_INLINE int
-PyDict_to_basic_properties(PyObject *,
+// Keep track of PyObject references with increased reference count
+// Entries are stored in fixed size array.
+#define PYOBJECT_ARRAY_MAX 5
+typedef struct pyobject_array_t {
+    int num_entries;
+    PyObject *entries[PYOBJECT_ARRAY_MAX];
+    struct pyobject_array_t *next;
+} pyobject_array_t;
+
+
+static void PyObjectArray_XDECREF(pyobject_array_t *array);
+
+_PYRMQ_INLINE PyObject* PyObjectArray_AddEntry(pyobject_array_t *, PyObject *obj);
+_PYRMQ_INLINE PyObject* PyObjectArray_Maybe_Unicode(PyObject *, pyobject_array_t *);
+
+
+static int PyDict_to_basic_properties(PyObject *,
                            amqp_basic_properties_t *,
                            amqp_connection_state_t,
-                           amqp_pool_t *);
+                           amqp_pool_t *,
+                           pyobject_array_t *);
 
 _PYRMQ_INLINE void
 amqp_basic_deliver_to_PyDict(PyObject *, uint64_t, amqp_bytes_t,
@@ -104,8 +126,8 @@ int PyRabbitMQ_HandleAMQError(PyRabbitMQ_Connection *, unsigned int,
 void PyRabbitMQ_SetErr_UnexpectedHeader(amqp_frame_t*);
 int PyRabbitMQ_Not_Connected(PyRabbitMQ_Connection *);
 
-static amqp_table_t PyDict_ToAMQTable(amqp_connection_state_t, PyObject *, amqp_pool_t *);
-static amqp_array_t PyIter_ToAMQArray(amqp_connection_state_t, PyObject *, amqp_pool_t *);
+static amqp_table_t PyDict_ToAMQTable(amqp_connection_state_t, PyObject *, amqp_pool_t *, pyobject_array_t *);
+static amqp_array_t PyIter_ToAMQArray(amqp_connection_state_t, PyObject *, amqp_pool_t *, pyobject_array_t *);
 
 static PyObject* AMQTable_toPyDict(amqp_table_t *table);
 static PyObject* AMQArray_toPyList(amqp_array_t *array);
@@ -158,6 +180,15 @@ AMQTable_SetStringValue(amqp_table_t *table,
     amqp_table_entry_t *entry = AMQTable_AddEntry(table, key);
     entry->value.kind = AMQP_FIELD_KIND_UTF8;
     entry->value.value.bytes = value;
+}
+
+_PYRMQ_INLINE void
+AMQTable_SetBoolValue(amqp_table_t *table,
+                      amqp_bytes_t key, int value)
+{
+    amqp_table_entry_t *entry = AMQTable_AddEntry(table, key);
+    entry->value.kind = AMQP_FIELD_KIND_BOOLEAN;
+    entry->value.value.boolean = value;
 }
 
 _PYRMQ_INLINE void
@@ -232,16 +263,16 @@ AMQArray_SetIntValue(amqp_array_t *array, int value)
 }
 
 static amqp_table_t
-PyDict_ToAMQTable(amqp_connection_state_t conn, PyObject *src, amqp_pool_t *pool)
+PyDict_ToAMQTable(amqp_connection_state_t conn, PyObject *src, amqp_pool_t *pool, pyobject_array_t *pyobj_array)
 {
     PyObject *dkey = NULL;
     PyObject *dvalue = NULL;
-    PY_SIZE_TYPE size = 0;
-    PY_SIZE_TYPE pos = 0;
+    Py_ssize_t size = 0;
+    Py_ssize_t pos = 0;
     uint64_t clong_value = 0;
     double cdouble_value = 0.0;
     int is_unicode = 0;
-    amqp_table_t dst = AMQP_EMPTY_TABLE;
+    amqp_table_t dst = amqp_empty_table;
 
     size = PyDict_Size(src);
 
@@ -249,6 +280,7 @@ PyDict_ToAMQTable(amqp_connection_state_t conn, PyObject *src, amqp_pool_t *pool
     dst.num_entries = 0;
     dst.entries = amqp_pool_alloc(pool, size * sizeof(amqp_table_entry_t));
     while (PyDict_Next(src, &pos, &dkey, &dvalue)) {
+        dkey = PyObjectArray_Maybe_Unicode(dkey, pyobj_array);
 
         if (dvalue == Py_None) {
             /* None */
@@ -258,19 +290,32 @@ PyDict_ToAMQTable(amqp_connection_state_t conn, PyObject *src, amqp_pool_t *pool
             /* Dict */
             AMQTable_SetTableValue(&dst,
                     PyString_AS_AMQBYTES(dkey),
-                    PyDict_ToAMQTable(conn, dvalue, pool));
+                    PyDict_ToAMQTable(conn, dvalue, pool, pyobj_array));
         }
         else if (PyList_Check(dvalue) || PyTuple_Check(dvalue)) {
             /* List */
             AMQTable_SetArrayValue(&dst,
                     PyString_AS_AMQBYTES(dkey),
-                    PyIter_ToAMQArray(conn, dvalue, pool));
+                    PyIter_ToAMQArray(conn, dvalue, pool, pyobj_array));
+        }
+        else if (PyBool_Check(dvalue)) {
+          /* Bool */
+          clong_value = 0;  /* default false */
+
+          if (dvalue == Py_True)
+            clong_value = 1;
+
+          AMQTable_SetBoolValue(&dst,
+                                PyString_AS_AMQBYTES(dkey),
+                                clong_value);
         }
         else if (PyLong_Check(dvalue) || PyInt_Check(dvalue)) {
             /* Int | Long */
             clong_value = (int64_t)PyLong_AsLong(dvalue);
-            if (PyErr_Occurred())
-                goto error;
+
+            if (clong_value == -1)
+              goto error;
+
             AMQTable_SetIntValue(&dst,
                     PyString_AS_AMQBYTES(dkey),
                     clong_value
@@ -278,8 +323,10 @@ PyDict_ToAMQTable(amqp_connection_state_t conn, PyObject *src, amqp_pool_t *pool
         }
         else if (PyFloat_Check(dvalue)) {
             cdouble_value = PyFloat_AsDouble(dvalue);
-            if (PyErr_Occurred())
-                goto error;
+
+            if (cdouble_value == -1)
+              goto error;
+
             AMQTable_SetDoubleValue(&dst,
                 PyString_AS_AMQBYTES(dkey),
                     cdouble_value
@@ -288,10 +335,11 @@ PyDict_ToAMQTable(amqp_connection_state_t conn, PyObject *src, amqp_pool_t *pool
         else {
             /* String | Unicode */
             is_unicode = PyUnicode_Check(dvalue);
-            if (is_unicode || PyString_Check(dvalue)) {
+            if (is_unicode || PyBytes_Check(dvalue)) {
                 if (is_unicode) {
-                    if ((dvalue = PyUnicode_AsASCIIString(dvalue)) == NULL)
+                    if ((dvalue = PyUnicode_AsEncodedString(dvalue, "utf-8", "strict")) == NULL)
                         goto error;
+                    PyObjectArray_AddEntry(pyobj_array, dvalue);
                 }
                 AMQTable_SetStringValue(&dst,
                         PyString_AS_AMQBYTES(dkey),
@@ -302,7 +350,7 @@ PyDict_ToAMQTable(amqp_connection_state_t conn, PyObject *src, amqp_pool_t *pool
                 /* unsupported type */
                 PyErr_Format(PyExc_ValueError,
                     "Table member %s is of an unsupported type",
-                    PyString_AS_STRING(dkey));
+                    PyBytes_AS_STRING(dkey));
                 goto error;
             }
         }
@@ -310,23 +358,24 @@ PyDict_ToAMQTable(amqp_connection_state_t conn, PyObject *src, amqp_pool_t *pool
     return dst;
 error:
     assert(PyErr_Occurred());
-    return AMQP_EMPTY_TABLE;
+    return amqp_empty_table;
 }
 
 static amqp_array_t
-PyIter_ToAMQArray(amqp_connection_state_t conn, PyObject *src, amqp_pool_t *pool)
+PyIter_ToAMQArray(amqp_connection_state_t conn, PyObject *src, amqp_pool_t *pool, pyobject_array_t *pyobj_array)
 {
-    PY_SIZE_TYPE pos = 0;
+    Py_ssize_t pos = 0;
     uint64_t clong_value = 0;
     int is_unicode = 0;
-    amqp_array_t dst = AMQP_EMPTY_ARRAY;
+    amqp_array_t dst = amqp_empty_array;
 
-    PY_SIZE_TYPE size = PySequence_Size(src);
+    Py_ssize_t size = PySequence_Size(src);
     if (size == -1) return dst;
 
     PyObject *iterator = PyObject_GetIter(src);
     if (iterator == NULL) return dst;
     PyObject *item = NULL;
+    PyObject *item_tmp = NULL;
 
     /* allocate new amqp array */
     dst.num_entries = 0;
@@ -340,25 +389,28 @@ PyIter_ToAMQArray(amqp_connection_state_t conn, PyObject *src, amqp_pool_t *pool
         else if (PyDict_Check(item)) {
             /* Dict */
             AMQArray_SetTableValue(
-                &dst, PyDict_ToAMQTable(conn, item, pool));
+                &dst, PyDict_ToAMQTable(conn, item, pool, pyobj_array));
         }
         else if (PyList_Check(item) || PyTuple_Check(item)) {
             /* List */
             AMQArray_SetArrayValue(
-                &dst, PyIter_ToAMQArray(conn, item, pool));
+                &dst, PyIter_ToAMQArray(conn, item, pool, pyobj_array));
         }
         else if (PyLong_Check(item) || PyInt_Check(item)) {
             /* Int | Long */
-            clong_value = (int64_t)PyLong_AsLong(item);
+            clong_value = (int64_t)PyLong_AsLongLong(item);
             AMQArray_SetIntValue(&dst, clong_value);
         }
         else {
             /* String | Unicode */
             is_unicode = PyUnicode_Check(item);
-            if (is_unicode || PyString_Check(item)) {
+            if (is_unicode || PyBytes_Check(item)) {
                 if (is_unicode) {
+                    /* PyUnicode_AsASCIIString returns a new ref! */
+                    item_tmp = item;
                     if ((item = PyUnicode_AsASCIIString(item)) == NULL)
                         goto item_error;
+                    Py_XDECREF(item_tmp);
                 }
                 AMQArray_SetStringValue(
                     &dst, PyString_AS_AMQBYTES(item));
@@ -366,8 +418,8 @@ PyIter_ToAMQArray(amqp_connection_state_t conn, PyObject *src, amqp_pool_t *pool
             else {
                 /* unsupported type */
                 PyErr_Format(PyExc_ValueError,
-                    "Array member at index %lu, %s, is of an unsupported type",
-                    pos, PyObject_REPR(item));
+                    "Array member at index %lu, %R, is of an unsupported type",
+                    pos, item);
                 goto item_error;
             }
         }
@@ -376,6 +428,7 @@ PyIter_ToAMQArray(amqp_connection_state_t conn, PyObject *src, amqp_pool_t *pool
 
     return dst;
 item_error:
+    Py_XDECREF(item_tmp);
     Py_XDECREF(item);
 error:
     Py_XDECREF(iterator);
@@ -581,7 +634,7 @@ AMQArray_toPyList(amqp_array_t *array)
 {
     register PyObject *value = NULL;
     PyObject *list = NULL;
-    list = PyList_New(array->num_entries);
+    list = PyList_New((Py_ssize_t) array->num_entries);
 
     if (array) {
         int i;
@@ -647,58 +700,58 @@ AMQArray_toPyList(amqp_array_t *array)
     return list;
 }
 
-_PYRMQ_INLINE int
-PyDict_to_basic_properties(PyObject *p,
+static int PyDict_to_basic_properties(PyObject *p,
                            amqp_basic_properties_t *props,
                            amqp_connection_state_t conn,
-                           amqp_pool_t *pool)
+                           amqp_pool_t *pool,
+                           pyobject_array_t *pyobj_array)
 {
     PyObject *value = NULL;
-    props->headers = AMQP_EMPTY_TABLE;
+    props->headers = amqp_empty_table;
     props->_flags = AMQP_BASIC_HEADERS_FLAG;
 
     if ((value = PyDict_GetItemString(p, "content_type")) != NULL) {
-        if ((value = Maybe_Unicode(value)) == NULL) return -1;
+        if ((value = PyObjectArray_Maybe_Unicode(value, pyobj_array)) == NULL) return -1;
         props->content_type = PyString_AS_AMQBYTES(value);
         props->_flags |= AMQP_BASIC_CONTENT_TYPE_FLAG;
     }
     if ((value = PyDict_GetItemString(p, "content_encoding")) != NULL) {
-        if ((value = Maybe_Unicode(value)) == NULL) return -1;
+        if ((value = PyObjectArray_Maybe_Unicode(value, pyobj_array)) == NULL) return -1;
         props->content_encoding = PyString_AS_AMQBYTES(value);
         props->_flags |= AMQP_BASIC_CONTENT_ENCODING_FLAG;
     }
     if ((value = PyDict_GetItemString(p, "correlation_id")) != NULL) {
-        if ((value = Maybe_Unicode(value)) == NULL) return -1;
+        if ((value = PyObjectArray_Maybe_Unicode(value, pyobj_array)) == NULL) return -1;
         props->correlation_id = PyString_AS_AMQBYTES(value);
         props->_flags |= AMQP_BASIC_CORRELATION_ID_FLAG;
     }
     if ((value = PyDict_GetItemString(p, "reply_to")) != NULL) {
-        if ((value = Maybe_Unicode(value)) == NULL) return -1;
+        if ((value = PyObjectArray_Maybe_Unicode(value, pyobj_array)) == NULL) return -1;
         props->reply_to = PyString_AS_AMQBYTES(value);
         props->_flags |= AMQP_BASIC_REPLY_TO_FLAG;
     }
     if ((value = PyDict_GetItemString(p, "expiration")) != NULL) {
-        if ((value = Maybe_Unicode(value)) == NULL) return -1;
+        if ((value = PyObjectArray_Maybe_Unicode(value, pyobj_array)) == NULL) return -1;
         props->expiration = PyString_AS_AMQBYTES(value);
         props->_flags |= AMQP_BASIC_EXPIRATION_FLAG;
     }
     if ((value = PyDict_GetItemString(p, "message_id")) != NULL) {
-        if ((value = Maybe_Unicode(value)) == NULL) return -1;
+        if ((value = PyObjectArray_Maybe_Unicode(value, pyobj_array)) == NULL) return -1;
         props->message_id = PyString_AS_AMQBYTES(value);
         props->_flags |= AMQP_BASIC_MESSAGE_ID_FLAG;
     }
     if ((value = PyDict_GetItemString(p, "type")) != NULL) {
-        if ((value = Maybe_Unicode(value)) == NULL) return -1;
+        if ((value = PyObjectArray_Maybe_Unicode(value, pyobj_array)) == NULL) return -1;
         props->type = PyString_AS_AMQBYTES(value);
         props->_flags |= AMQP_BASIC_TYPE_FLAG;
     }
     if ((value = PyDict_GetItemString(p, "user_id")) != NULL) {
-        if ((value = Maybe_Unicode(value)) == NULL) return -1;
+        if ((value = PyObjectArray_Maybe_Unicode(value, pyobj_array)) == NULL) return -1;
         props->user_id = PyString_AS_AMQBYTES(value);
         props->_flags |= AMQP_BASIC_USER_ID_FLAG;
     }
     if ((value = PyDict_GetItemString(p, "app_id")) != NULL) {
-        if ((value = Maybe_Unicode(value)) == NULL) return -1;
+        if ((value = PyObjectArray_Maybe_Unicode(value, pyobj_array)) == NULL) return -1;
         props->app_id = PyString_AS_AMQBYTES(value);
         props->_flags |= AMQP_BASIC_APP_ID_FLAG;
     }
@@ -711,12 +764,12 @@ PyDict_to_basic_properties(PyObject *p,
         props->_flags |= AMQP_BASIC_PRIORITY_FLAG;
     }
     if ((value = PyDict_GetItemString(p, "timestamp")) != NULL) {
-        props->timestamp = (uint8_t)PyInt_AS_LONG(value);
+        props->timestamp = (uint64_t)PyInt_AS_LONG(value);
         props->_flags |= AMQP_BASIC_TIMESTAMP_FLAG;
     }
 
     if ((value = PyDict_GetItemString(p, "headers")) != NULL) {
-        props->headers = PyDict_ToAMQTable(conn, value, pool);
+        props->headers = PyDict_ToAMQTable(conn, value, pool, pyobj_array);
         if (PyErr_Occurred()) return -1;
     }
     return 1;
@@ -732,7 +785,7 @@ amqp_basic_deliver_to_PyDict(PyObject *dest,
     PyObject *value = NULL;
 
     /* -- delivery_tag (PyInt)                               */
-    value = PyLong_FROM_SSIZE_T((PY_SIZE_TYPE)delivery_tag);
+    value = PyLong_FromLongLong(delivery_tag);
     PyDICT_SETSTR_DECREF(dest, "delivery_tag", value);
 
     /* -- exchange (PyString)                                */
@@ -748,6 +801,60 @@ amqp_basic_deliver_to_PyDict(PyObject *dest,
     PyDICT_SETSTR_DECREF(dest, "redelivered", value);
 
     return;
+}
+
+/* ------: Keep track of increased reference counts :------------------------ */
+
+_PYRMQ_INLINE PyObject*
+PyObjectArray_Maybe_Unicode(PyObject *s, pyobject_array_t *array)
+{
+    if (PyUnicode_Check(s)) {
+        return PyObjectArray_AddEntry(array, PyUnicode_AsASCIIString(s));
+    }
+    return s;
+}
+
+_PYRMQ_INLINE PyObject*
+PyObjectArray_AddEntry(pyobject_array_t *array, PyObject *obj)
+{
+    if (!obj) {
+        return obj;
+    }
+
+    if (array->num_entries == PYOBJECT_ARRAY_MAX) {
+        if (!array->next) {
+            array->next = (pyobject_array_t *) calloc(1, sizeof(pyobject_array_t));
+        }
+
+        return PyObjectArray_AddEntry(array->next, obj);
+    }
+
+    array->entries[array->num_entries] = obj;
+    array->num_entries++;
+
+    return obj;
+}
+
+static void PyObjectArray_XDECREF(pyobject_array_t *array)
+{
+    int i;
+
+    if (!array) {
+        return;
+    }
+
+    if (array->next) {
+        PyObjectArray_XDECREF(array->next);
+        free(array->next);
+        array->next = (pyobject_array_t *) 0;
+    }
+
+
+    for (i = 0; i < array->num_entries; ++i) {
+        Py_XDECREF(array->entries[i]);
+    }
+
+    array->num_entries = 0;
 }
 
 /* ------: Error Handlers :----------------------------------------------- */
@@ -908,9 +1015,23 @@ PyRabbitMQ_ConnectionType_dealloc(PyRabbitMQ_Connection *self)
 {
     if (self->weakreflist != NULL)
         PyObject_ClearWeakRefs((PyObject*)self);
+
+    if (self->hostname != NULL)
+      PyMem_Free(self->hostname);
+
+    if (self->userid != NULL)
+      PyMem_Free(self->userid);
+
+    if (self->password != NULL)
+      PyMem_Free(self->password);
+
+    if (self->virtual_host != NULL)
+      PyMem_Free(self->virtual_host);
+
     Py_XDECREF(self->callbacks);
+    Py_XDECREF(self->client_properties);
     Py_XDECREF(self->server_properties);
-    self->ob_type->tp_free(self);
+    Py_TYPE(self)->tp_free(self);
 }
 
 
@@ -930,27 +1051,40 @@ PyRabbitMQ_ConnectionType_init(PyRabbitMQ_Connection *self,
         "channel_max",
         "frame_max",
         "heartbeat",
+        "client_properties",
         NULL
     };
-    char *hostname = "localhost";
-    char *userid = "guest";
-    char *password = "guest";
-    char *virtual_host = "/";
+    char *hostname;
+    char *userid;
+    char *password;
+    char *virtual_host;
+
     int channel_max = 0xffff;
     int frame_max = 131072;
     int heartbeat = 0;
     int port = 5672;
+    PyObject *client_properties = NULL;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|ssssiiii", kwlist,
-                &hostname, &userid, &password, &virtual_host, &port,
-                &channel_max, &frame_max, &heartbeat)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|ssssiiiiO", kwlist,
+                                     &hostname, &userid, &password, &virtual_host, &port,
+                                     &channel_max, &frame_max, &heartbeat, &client_properties)) {
         return -1;
     }
 
-    self->hostname = hostname;
-    self->userid = userid;
-    self->password = password;
-    self->virtual_host = virtual_host;
+    self->hostname = PyMem_Malloc(strlen(hostname) + 1);
+    self->userid = PyMem_Malloc(strlen(userid) + 1);
+    self->password = PyMem_Malloc(strlen(password) + 1);
+    self->virtual_host = PyMem_Malloc(strlen(virtual_host) + 1);
+
+    if (self->hostname == NULL || self->userid == NULL || self->password == NULL || self->virtual_host == NULL) {
+        return PyErr_NoMemory();
+    }
+
+    strcpy(self->hostname, hostname);
+    strcpy(self->userid, userid);
+    strcpy(self->password, password);
+    strcpy(self->virtual_host, virtual_host);
+
     self->port = port;
     self->channel_max = channel_max;
     self->frame_max = frame_max;
@@ -958,8 +1092,10 @@ PyRabbitMQ_ConnectionType_init(PyRabbitMQ_Connection *self,
     self->weakreflist = NULL;
     self->callbacks = PyDict_New();
     if (self->callbacks == NULL) return -1;
-    self->server_properties = NULL;
 
+    Py_XINCREF(client_properties);
+    self->client_properties = client_properties;
+    self->server_properties = NULL;
     return 0;
 }
 
@@ -989,6 +1125,10 @@ PyRabbitMQ_Connection_connect(PyRabbitMQ_Connection *self)
     int status;
     amqp_socket_t *socket = NULL;
     amqp_rpc_reply_t reply;
+    amqp_pool_t pool;
+    amqp_table_t properties;
+
+    pyobject_array_t pyobj_array = {0};
 
     if (self->connected) {
         PyErr_SetString(PyRabbitMQExc_ConnectionError, "Already connected");
@@ -1012,12 +1152,26 @@ PyRabbitMQ_Connection_connect(PyRabbitMQ_Connection *self)
 
     Py_BEGIN_ALLOW_THREADS;
     self->sockfd = amqp_socket_get_sockfd(socket);
-    reply = amqp_login(self->conn, self->virtual_host, self->channel_max,
-                       self->frame_max, self->heartbeat,
-                       AMQP_SASL_METHOD_PLAIN, self->userid, self->password);
+
+    if (self->client_properties != NULL && PyDict_Check(self->client_properties)) {
+      init_amqp_pool(&pool, self->frame_max);
+      properties = PyDict_ToAMQTable(self->conn, self->client_properties, &pool, &pyobj_array);
+
+      reply = amqp_login_with_properties(self->conn, self->virtual_host, self->channel_max,
+                                         self->frame_max, self->heartbeat,
+                                         &properties,
+                                         AMQP_SASL_METHOD_PLAIN, self->userid, self->password);
+      PyObjectArray_XDECREF(&pyobj_array);
+    } else {
+      reply = amqp_login(self->conn, self->virtual_host, self->channel_max,
+                         self->frame_max, self->heartbeat,
+                         AMQP_SASL_METHOD_PLAIN, self->userid, self->password);
+    }
+
     Py_END_ALLOW_THREADS;
+
     if (PyRabbitMQ_HandleAMQError(self, 0, reply, "Couldn't log in"))
-        goto bail;
+      goto bail;
 
     /* after tune */
     self->connected = 1;
@@ -1029,8 +1183,9 @@ PyRabbitMQ_Connection_connect(PyRabbitMQ_Connection *self)
 error:
     PyRabbitMQ_Connection_close(self);
 bail:
-    return 0;
+    PyObjectArray_XDECREF(&pyobj_array);
 
+    return 0;
 }
 
 
@@ -1165,7 +1320,7 @@ PyRabbitMQ_ApplyCallback(PyRabbitMQ_Connection *self,
         goto error;
 
     /* message = self.Message(channel, properties, delivery_info, body) */
-    Message = PyString_FromString("Message");
+    Message = BUILD_METHOD_NAME("Message");
     message = PyObject_CallMethodObjArgs((PyObject *)self, Message,
                 channelobj, propdict, delivery_info, view, NULL);
     if (!message)
@@ -1231,10 +1386,11 @@ PyRabbitMQ_recv(PyRabbitMQ_Connection *self, PyObject *p,
                 amqp_connection_state_t conn, int piggyback)
 {
     amqp_frame_t frame;
+    amqp_channel_t cur_channel = 0;
     amqp_basic_deliver_t *deliver;
     amqp_basic_properties_t *props;
-    size_t body_target;
-    size_t body_received;
+    Py_ssize_t body_target;
+    Py_ssize_t body_received;
     PyObject *channel = NULL;
     PyObject *consumer_tag = NULL;
     PyObject *delivery_info = NULL;
@@ -1259,6 +1415,8 @@ PyRabbitMQ_recv(PyRabbitMQ_Connection *self, PyObject *p,
             if (frame.frame_type != AMQP_FRAME_METHOD) continue;
             if (frame.payload.method.id != AMQP_BASIC_DELIVER_METHOD) goto altframe;
 
+            cur_channel = frame.channel;
+
             delivery_info = PyDict_New();
             deliver = (amqp_basic_deliver_t *)frame.payload.method.decoded;
             /* need consumer tag for later.
@@ -1277,7 +1435,9 @@ PyRabbitMQ_recv(PyRabbitMQ_Connection *self, PyObject *p,
         }
 
         Py_BEGIN_ALLOW_THREADS;
-        retval = amqp_simple_wait_frame(conn, &frame);
+        retval = cur_channel == 0 ?
+            amqp_simple_wait_frame(conn, &frame) :
+            amqp_simple_wait_frame_on_channel(conn, cur_channel, &frame);
         Py_END_ALLOW_THREADS;
         if (retval < 0) break;
 
@@ -1287,8 +1447,11 @@ PyRabbitMQ_recv(PyRabbitMQ_Connection *self, PyObject *p,
             goto finally;
         }
 
+        /* if piggybacked, 'channel' is still 0 at this point */
+        cur_channel = frame.channel;
+
         /* channel */
-        channel = PyInt_FromLong((long)frame.channel);
+        channel = PyInt_FromLong((unsigned long)frame.channel);
 
         /* properties */
         props = (amqp_basic_properties_t *)frame.payload.properties.decoded;
@@ -1300,7 +1463,7 @@ PyRabbitMQ_recv(PyRabbitMQ_Connection *self, PyObject *p,
 
         for (i = 0; body_received < body_target; i++) {
             Py_BEGIN_ALLOW_THREADS;
-            retval = amqp_simple_wait_frame(conn, &frame);
+            retval = amqp_simple_wait_frame_on_channel(conn, cur_channel, &frame);
             Py_END_ALLOW_THREADS;
             if (retval < 0) break;
 
@@ -1314,23 +1477,21 @@ PyRabbitMQ_recv(PyRabbitMQ_Connection *self, PyObject *p,
             body_received += frame.payload.body_fragment.len;
             if (!i) {
                 if (body_received < body_target) {
-                    payload = PyString_FromStringAndSize(NULL,
-                                       (PY_SIZE_TYPE)body_target);
+                    payload = PyBytes_FromStringAndSize(NULL,
+                                       (Py_ssize_t)body_target);
                     if (!payload)
                         goto finally;
-                    buf = PyString_AsString(payload);
+                    buf = PyBytes_AsString(payload);
                     if (!buf)
                         goto finally;
-                    view = PyBuffer_FromObject(payload, 0,
-                                   (PY_SIZE_TYPE)body_target);
+                    view = PyMemoryView_FromObject(payload);
                 }
                 else {
                     if (p) {
                         payload = PySTRING_FROM_AMQBYTES(
                                     frame.payload.body_fragment);
                     } else {
-                        view = PyBuffer_FromMemory(bufp,
-                                    (PY_SIZE_TYPE)frame.payload.body_fragment.len);
+                        view = buffer_toMemoryView(bufp, (Py_ssize_t)frame.payload.body_fragment.len);
                     }
                     break;
                 }
@@ -1345,7 +1506,7 @@ PyRabbitMQ_recv(PyRabbitMQ_Connection *self, PyObject *p,
                 if (body_target) goto error;
 
                 /* did not expect content, return empty string */
-                payload = PyString_FromStringAndSize(NULL, 0);
+                payload = PyBytes_FromStringAndSize(NULL, 0);
             }
 
             PyDict_SetItemString(p, "properties", propdict);
@@ -1389,9 +1550,11 @@ PyRabbitMQ_Connection_queue_bind(PyRabbitMQ_Connection *self,
     PyObject *routing_key = NULL;
     PyObject *arguments = NULL;
 
-    amqp_table_t bargs = AMQP_EMPTY_TABLE;
+    amqp_table_t bargs = amqp_empty_table;
     amqp_pool_t *channel_pool = NULL;
     amqp_rpc_reply_t reply;
+
+    pyobject_array_t pyobj_array = {0};
 
     if (PyRabbitMQ_Not_Connected(self))
         goto bail;
@@ -1399,16 +1562,16 @@ PyRabbitMQ_Connection_queue_bind(PyRabbitMQ_Connection *self,
     if (!PyArg_ParseTuple(args, "IOOOO",
             &channel, &queue, &exchange, &routing_key, &arguments))
         goto bail;
-    if ((queue = Maybe_Unicode(queue)) == NULL) goto bail;
-    if ((exchange = Maybe_Unicode(exchange)) == NULL) goto bail;
-    if ((routing_key = Maybe_Unicode(routing_key)) == NULL) goto bail;
+    if ((queue = PyObjectArray_Maybe_Unicode(queue, &pyobj_array)) == NULL) goto bail;
+    if ((exchange = PyObjectArray_Maybe_Unicode(exchange, &pyobj_array)) == NULL) goto bail;
+    if ((routing_key = PyObjectArray_Maybe_Unicode(routing_key, &pyobj_array)) == NULL) goto bail;
 
     channel_pool = amqp_get_or_create_channel_pool(self->conn, (amqp_channel_t)channel);
     if (channel_pool == NULL) {
         PyErr_NoMemory();
         goto bail;
     }
-    bargs = PyDict_ToAMQTable(self->conn, arguments, channel_pool);
+    bargs = PyDict_ToAMQTable(self->conn, arguments, channel_pool, &pyobj_array);
     if (PyErr_Occurred())
         goto bail;
 
@@ -1421,12 +1584,15 @@ PyRabbitMQ_Connection_queue_bind(PyRabbitMQ_Connection *self,
     reply = amqp_get_rpc_reply(self->conn);
     amqp_maybe_release_buffers_on_channel(self->conn, channel);
     Py_END_ALLOW_THREADS;
+    PyObjectArray_XDECREF(&pyobj_array);
 
     if (PyRabbitMQ_HandleAMQError(self, channel, reply, "queue.bind"))
         goto bail;
 
     Py_RETURN_NONE;
 bail:
+    PyObjectArray_XDECREF(&pyobj_array);
+
     return 0;
 }
 
@@ -1444,9 +1610,11 @@ PyRabbitMQ_Connection_queue_unbind(PyRabbitMQ_Connection *self,
     PyObject *routing_key = NULL;
     PyObject *arguments = NULL;
 
-    amqp_table_t uargs = AMQP_EMPTY_TABLE;
+    amqp_table_t uargs = amqp_empty_table;
     amqp_pool_t *channel_pool = NULL;
     amqp_rpc_reply_t reply;
+
+    pyobject_array_t pyobj_array = {0};
 
     if (PyRabbitMQ_Not_Connected(self))
         goto bail;
@@ -1454,16 +1622,16 @@ PyRabbitMQ_Connection_queue_unbind(PyRabbitMQ_Connection *self,
     if (!PyArg_ParseTuple(args, "IOOOO",
             &channel, &queue, &exchange, &routing_key, &arguments))
         goto bail;
-    if ((queue = Maybe_Unicode(queue)) == NULL) goto bail;
-    if ((exchange = Maybe_Unicode(exchange)) == NULL) goto bail;
-    if ((routing_key = Maybe_Unicode(routing_key)) == NULL) goto bail;
+    if ((queue = PyObjectArray_Maybe_Unicode(queue, &pyobj_array)) == NULL) goto bail;
+    if ((exchange = PyObjectArray_Maybe_Unicode(exchange, &pyobj_array)) == NULL) goto bail;
+    if ((routing_key = PyObjectArray_Maybe_Unicode(routing_key, &pyobj_array)) == NULL) goto bail;
 
     channel_pool = amqp_get_or_create_channel_pool(self->conn, (amqp_channel_t)channel);
     if (channel_pool == NULL) {
         PyErr_NoMemory();
         goto bail;
     }
-    uargs = PyDict_ToAMQTable(self->conn, arguments, channel_pool);
+    uargs = PyDict_ToAMQTable(self->conn, arguments, channel_pool, &pyobj_array);
     if (PyErr_Occurred())
         goto bail;
 
@@ -1476,12 +1644,15 @@ PyRabbitMQ_Connection_queue_unbind(PyRabbitMQ_Connection *self,
     reply = amqp_get_rpc_reply(self->conn);
     amqp_maybe_release_buffers_on_channel(self->conn, channel);
     Py_END_ALLOW_THREADS;
+    PyObjectArray_XDECREF(&pyobj_array);
 
     if (PyRabbitMQ_HandleAMQError(self, channel, reply, "queue.unbind"))
         goto bail;
 
     Py_RETURN_NONE;
 bail:
+    PyObjectArray_XDECREF(&pyobj_array);
+
     return 0;
 }
 
@@ -1500,13 +1671,15 @@ PyRabbitMQ_Connection_queue_delete(PyRabbitMQ_Connection *self,
     amqp_queue_delete_ok_t *ok;
     amqp_rpc_reply_t reply;
 
+    pyobject_array_t pyobj_array = {0};
+
     if (PyRabbitMQ_Not_Connected(self))
         goto bail;
 
     if (!PyArg_ParseTuple(args, "IOII",
             &channel, &queue, &if_unused, &if_empty))
         goto bail;
-    if ((queue = Maybe_Unicode(queue)) == NULL) goto bail;
+    if ((queue = PyObjectArray_Maybe_Unicode(queue, &pyobj_array)) == NULL) goto bail;
 
     Py_BEGIN_ALLOW_THREADS;
     ok = amqp_queue_delete(self->conn, channel,
@@ -1516,6 +1689,7 @@ PyRabbitMQ_Connection_queue_delete(PyRabbitMQ_Connection *self,
     if (ok == NULL)
         reply = amqp_get_rpc_reply(self->conn);
     amqp_maybe_release_buffers_on_channel(self->conn, channel);
+    PyObjectArray_XDECREF(&pyobj_array);
     Py_END_ALLOW_THREADS;
 
     if (ok == NULL && PyRabbitMQ_HandleAMQError(self, channel,
@@ -1524,6 +1698,7 @@ PyRabbitMQ_Connection_queue_delete(PyRabbitMQ_Connection *self,
 
     return PyInt_FromLong((long)ok->message_count);
 bail:
+    PyObjectArray_XDECREF(&pyobj_array);
     return 0;
 }
 
@@ -1546,8 +1721,10 @@ PyRabbitMQ_Connection_queue_declare(PyRabbitMQ_Connection *self,
     amqp_queue_declare_ok_t *ok;
     amqp_rpc_reply_t reply;
     amqp_pool_t *channel_pool = NULL;
-    amqp_table_t qargs = AMQP_EMPTY_TABLE;
+    amqp_table_t qargs = amqp_empty_table;
     PyObject *ret = NULL;
+
+    pyobject_array_t pyobj_array = {0};
 
     if (PyRabbitMQ_Not_Connected(self))
         goto bail;
@@ -1556,13 +1733,13 @@ PyRabbitMQ_Connection_queue_declare(PyRabbitMQ_Connection *self,
             &channel, &queue, &passive, &durable,
             &exclusive, &auto_delete, &arguments))
         goto bail;
-    if ((queue = Maybe_Unicode(queue)) == NULL) goto bail;
+    if ((queue = PyObjectArray_Maybe_Unicode(queue, &pyobj_array)) == NULL) goto bail;
     channel_pool = amqp_get_or_create_channel_pool(self->conn, (amqp_channel_t)channel);
     if (channel_pool == NULL) {
         PyErr_NoMemory();
         goto bail;
     }
-    qargs = PyDict_ToAMQTable(self->conn, arguments, channel_pool);
+    qargs = PyDict_ToAMQTable(self->conn, arguments, channel_pool, &pyobj_array);
     if (PyErr_Occurred())
         goto bail;
 
@@ -1577,17 +1754,19 @@ PyRabbitMQ_Connection_queue_declare(PyRabbitMQ_Connection *self,
     );
     reply = amqp_get_rpc_reply(self->conn);
     Py_END_ALLOW_THREADS;
+    PyObjectArray_XDECREF(&pyobj_array);
 
     if (PyRabbitMQ_HandleAMQError(self, channel, reply, "queue.declare"))
         goto bail;
 
     if ((ret = PyTuple_New(3)) == NULL) goto bail;
-    PyTuple_SET_ITEM(ret, 0, PyString_FromStringAndSize(ok->queue.bytes,
-                                                        ok->queue.len));
+    PyTuple_SET_ITEM(ret, 0, PySTRING_FROM_AMQBYTES(ok->queue));
     PyTuple_SET_ITEM(ret, 1, PyInt_FromLong((long)ok->message_count));
     PyTuple_SET_ITEM(ret, 2, PyInt_FromLong((long)ok->consumer_count));
     return ret;
 bail:
+    PyObjectArray_XDECREF(&pyobj_array);
+
     return 0;
 }
 
@@ -1606,18 +1785,21 @@ PyRabbitMQ_Connection_queue_purge(PyRabbitMQ_Connection *self,
     amqp_queue_purge_ok_t *ok;
     amqp_rpc_reply_t reply;
 
+    pyobject_array_t pyobj_array = {0};
+
     if (PyRabbitMQ_Not_Connected(self))
         goto bail;
 
     if (!PyArg_ParseTuple(args, "IOI", &channel, &queue, &no_wait))
         goto bail;
-    if ((queue = Maybe_Unicode(queue)) == NULL) goto bail;
+    if ((queue = PyObjectArray_Maybe_Unicode(queue, &pyobj_array)) == NULL) goto bail;
 
     Py_BEGIN_ALLOW_THREADS;
     ok = amqp_queue_purge(self->conn, channel,
                           PyString_AS_AMQBYTES(queue));
     reply = amqp_get_rpc_reply(self->conn);
     amqp_maybe_release_buffers_on_channel(self->conn, channel);
+    PyObjectArray_XDECREF(&pyobj_array);
     Py_END_ALLOW_THREADS;
 
     if (PyRabbitMQ_HandleAMQError(self, channel, reply, "queue.purge"))
@@ -1625,6 +1807,7 @@ PyRabbitMQ_Connection_queue_purge(PyRabbitMQ_Connection *self,
 
     return PyInt_FromLong((long)ok->message_count);
 bail:
+    PyObjectArray_XDECREF(&pyobj_array);
     return 0;
 }
 
@@ -1646,9 +1829,11 @@ PyRabbitMQ_Connection_exchange_declare(PyRabbitMQ_Connection *self,
      * as it has been decided that it's not that useful after all. */
     unsigned int auto_delete = 0;
 
-    amqp_table_t eargs = AMQP_EMPTY_TABLE;
+    amqp_table_t eargs = amqp_empty_table;
     amqp_pool_t *channel_pool = NULL;
     amqp_rpc_reply_t reply;
+
+    pyobject_array_t pyobj_array = {0};
 
     if (PyRabbitMQ_Not_Connected(self))
         goto bail;
@@ -1657,14 +1842,16 @@ PyRabbitMQ_Connection_exchange_declare(PyRabbitMQ_Connection *self,
             &channel, &exchange, &type, &passive,
             &durable, &auto_delete, &arguments))
         goto bail;
-    if ((exchange = Maybe_Unicode(exchange)) == NULL) goto bail;
-    if ((type = Maybe_Unicode(type)) == NULL) goto bail;
+    if ((exchange = PyObjectArray_Maybe_Unicode(exchange, &pyobj_array)) == NULL) goto bail;
+    if ((type = PyObjectArray_Maybe_Unicode(type, &pyobj_array)) == NULL) goto bail;
+
     channel_pool = amqp_get_or_create_channel_pool(self->conn, (amqp_channel_t)channel);
     if (channel_pool == NULL) {
         PyErr_NoMemory();
         goto bail;
     }
-    eargs = PyDict_ToAMQTable(self->conn, arguments, channel_pool);
+
+    eargs = PyDict_ToAMQTable(self->conn, arguments, channel_pool, &pyobj_array);
     if (PyErr_Occurred())
         goto bail;
 
@@ -1678,11 +1865,14 @@ PyRabbitMQ_Connection_exchange_declare(PyRabbitMQ_Connection *self,
     );
     reply = amqp_get_rpc_reply(self->conn);
     Py_END_ALLOW_THREADS;
+    PyObjectArray_XDECREF(&pyobj_array);
 
     if (PyRabbitMQ_HandleAMQError(self, channel, reply, "exchange.declare"))
         goto bail;
     Py_RETURN_NONE;
 bail:
+    PyObjectArray_XDECREF(&pyobj_array);
+
     return 0;
 }
 
@@ -1699,12 +1889,14 @@ PyRabbitMQ_Connection_exchange_delete(PyRabbitMQ_Connection *self,
 
     amqp_rpc_reply_t reply;
 
+    pyobject_array_t pyobj_array = {0};
+
     if (PyRabbitMQ_Not_Connected(self))
         goto bail;
 
     if (!PyArg_ParseTuple(args, "IOI", &channel, &exchange, &if_unused))
         goto bail;
-    if ((exchange = Maybe_Unicode(exchange)) == NULL) goto bail;
+    if ((exchange = PyObjectArray_Maybe_Unicode(exchange, &pyobj_array)) == NULL) goto bail;
 
     Py_BEGIN_ALLOW_THREADS;
     amqp_exchange_delete(self->conn, channel,
@@ -1713,12 +1905,15 @@ PyRabbitMQ_Connection_exchange_delete(PyRabbitMQ_Connection *self,
     reply = amqp_get_rpc_reply(self->conn);
     amqp_maybe_release_buffers_on_channel(self->conn, channel);
     Py_END_ALLOW_THREADS;
+    PyObjectArray_XDECREF(&pyobj_array);
 
     if (PyRabbitMQ_HandleAMQError(self, channel, reply, "exchange.delete"))
         goto bail;
 
     Py_RETURN_NONE;
 bail:
+    PyObjectArray_XDECREF(&pyobj_array);
+
     return 0;
 }
 
@@ -1737,7 +1932,7 @@ PyRabbitMQ_Connection_basic_publish(PyRabbitMQ_Connection *self,
     unsigned int immediate = 0;
 
     char *body_buf = NULL;
-    int *body_size = 0;
+    Py_ssize_t body_size = 0;
 
     int ret = 0;
     amqp_basic_properties_t props;
@@ -1745,19 +1940,23 @@ PyRabbitMQ_Connection_basic_publish(PyRabbitMQ_Connection *self,
     amqp_pool_t *channel_pool = NULL;
     memset(&props, 0, sizeof(props));
 
+    pyobject_array_t pyobj_array = {0};
+
     if (PyRabbitMQ_Not_Connected(self))
         goto bail;
 
-    if (!PyArg_ParseTuple(args, "It#OOO|II",
+    if (!PyArg_ParseTuple(args, "Is#OOO|II",
             &channel, &body_buf, &body_size, &exchange, &routing_key,
             &propdict, &mandatory, &immediate))
         goto bail;
-    if ((exchange = Maybe_Unicode(exchange)) == NULL) goto bail;
-    if ((routing_key = Maybe_Unicode(routing_key)) == NULL) goto bail;
+
+    if ((exchange = PyObjectArray_Maybe_Unicode(exchange, &pyobj_array)) == NULL) goto bail;
+    if ((routing_key = PyObjectArray_Maybe_Unicode(routing_key, &pyobj_array)) == NULL) goto bail;
 
     Py_INCREF(propdict);
     channel_pool = amqp_get_or_create_channel_pool(self->conn, (amqp_channel_t)channel);
-    if (PyDict_to_basic_properties(propdict, &props, self->conn, channel_pool) < 1) {
+
+    if (PyDict_to_basic_properties(propdict, &props, self->conn, channel_pool, &pyobj_array) < 1) {
         goto bail;
     }
     Py_DECREF(propdict);
@@ -1775,6 +1974,7 @@ PyRabbitMQ_Connection_basic_publish(PyRabbitMQ_Connection *self,
                              bytes);
     amqp_maybe_release_buffers_on_channel(self->conn, channel);
     Py_END_ALLOW_THREADS;
+    PyObjectArray_XDECREF(&pyobj_array);
 
     if (!PyRabbitMQ_HandleError(ret, "basic.publish")) {
         goto error;
@@ -1784,6 +1984,8 @@ PyRabbitMQ_Connection_basic_publish(PyRabbitMQ_Connection *self,
 error:
     PyRabbitMQ_revive_channel(self, channel);
 bail:
+    PyObjectArray_XDECREF(&pyobj_array);
+
     return 0;
 }
 
@@ -1795,7 +1997,7 @@ static PyObject*
 PyRabbitMQ_Connection_basic_ack(PyRabbitMQ_Connection *self,
                                 PyObject *args)
 {
-    PY_SIZE_TYPE delivery_tag = 0;
+    Py_ssize_t delivery_tag = 0;
     unsigned int channel = 0;
     unsigned int multiple = 0;
     int ret = 0;
@@ -1828,7 +2030,7 @@ bail:
 static PyObject *PyRabbitMQ_Connection_basic_reject(PyRabbitMQ_Connection *self,
                                                     PyObject *args)
 {
-    PY_SIZE_TYPE delivery_tag = 0;
+    Py_ssize_t delivery_tag = 0;
     unsigned int channel = 0;
     unsigned int multiple = 0;
 
@@ -1870,18 +2072,21 @@ PyRabbitMQ_Connection_basic_cancel(PyRabbitMQ_Connection *self,
     amqp_basic_cancel_ok_t *ok;
     amqp_rpc_reply_t reply;
 
+    pyobject_array_t pyobj_array = {0};
+
     if (PyRabbitMQ_Not_Connected(self))
         goto ok;
 
     if (!PyArg_ParseTuple(args, "IO", &channel, &consumer_tag))
         goto bail;
-    if ((consumer_tag = Maybe_Unicode(consumer_tag)) == NULL) goto bail;
+    if ((consumer_tag = PyObjectArray_Maybe_Unicode(consumer_tag, &pyobj_array)) == NULL) goto bail;
 
     Py_BEGIN_ALLOW_THREADS;
     ok = amqp_basic_cancel(self->conn, channel,
                            PyString_AS_AMQBYTES(consumer_tag));
     reply = amqp_get_rpc_reply(self->conn);
     amqp_maybe_release_buffers_on_channel(self->conn, channel);
+    PyObjectArray_XDECREF(&pyobj_array);
     Py_END_ALLOW_THREADS;
 
     if (PyRabbitMQ_HandleAMQError(self, channel, reply, "basic.cancel"))
@@ -1890,6 +2095,8 @@ PyRabbitMQ_Connection_basic_cancel(PyRabbitMQ_Connection *self,
 ok:
     Py_RETURN_NONE;
 bail:
+    PyObjectArray_XDECREF(&pyobj_array);
+
     return 0;
 }
 
@@ -1912,7 +2119,9 @@ PyRabbitMQ_Connection_basic_consume(PyRabbitMQ_Connection *self,
     amqp_basic_consume_ok_t *ok;
     amqp_rpc_reply_t reply;
     amqp_pool_t *channel_pool = NULL;
-    amqp_table_t cargs = AMQP_EMPTY_TABLE;
+    amqp_table_t cargs = amqp_empty_table;
+
+    pyobject_array_t pyobj_array = {0};
 
     if (PyRabbitMQ_Not_Connected(self))
         goto bail;
@@ -1921,16 +2130,18 @@ PyRabbitMQ_Connection_basic_consume(PyRabbitMQ_Connection *self,
             &channel, &queue, &consumer_tag, &no_local,
             &no_ack, &exclusive, &arguments))
         goto bail;
-    if ((queue = Maybe_Unicode(queue)) == NULL) goto bail;
-    if ((consumer_tag = Maybe_Unicode(consumer_tag)) == NULL) goto bail;
+    if ((queue = PyObjectArray_Maybe_Unicode(queue, &pyobj_array)) == NULL) goto bail;
+    if ((consumer_tag = PyObjectArray_Maybe_Unicode(consumer_tag, &pyobj_array)) == NULL) goto bail;
 
     channel_pool = amqp_get_or_create_channel_pool(self->conn, (amqp_channel_t)channel);
     if (channel_pool == NULL) {
         PyErr_NoMemory();
         goto bail;
     }
-    cargs = PyDict_ToAMQTable(self->conn, arguments, channel_pool);
-    if (PyErr_Occurred()) goto bail;
+
+    cargs = PyDict_ToAMQTable(self->conn, arguments, channel_pool, &pyobj_array);
+    if (PyErr_Occurred())
+        goto bail;
 
     Py_BEGIN_ALLOW_THREADS;
     ok = amqp_basic_consume(self->conn, channel,
@@ -1942,12 +2153,15 @@ PyRabbitMQ_Connection_basic_consume(PyRabbitMQ_Connection *self,
                             cargs);
     reply = amqp_get_rpc_reply(self->conn);
     Py_END_ALLOW_THREADS;
+    PyObjectArray_XDECREF(&pyobj_array);
 
     if (PyRabbitMQ_HandleAMQError(self, channel, reply, "basic.consume"))
         goto bail;
 
     return PySTRING_FROM_AMQBYTES(ok->consumer_tag);
 bail:
+    PyObjectArray_XDECREF(&pyobj_array);
+
     return 0;
 }
 
@@ -1959,7 +2173,7 @@ PyRabbitMQ_Connection_basic_qos(PyRabbitMQ_Connection *self,
                                 PyObject *args)
 {
     unsigned int channel = 0;
-    PY_SIZE_TYPE prefetch_size = 0;
+    Py_ssize_t prefetch_size = 0;
     unsigned int prefetch_count = 0;
     unsigned int _global = 0;
 
@@ -2111,18 +2325,22 @@ PyRabbitMQ_Connection_basic_get(PyRabbitMQ_Connection *self,
     amqp_basic_get_ok_t *ok = NULL;
     PyObject *p = NULL;
     PyObject *delivery_info = NULL;
+    PyObject *message_count = NULL;
+
+    pyobject_array_t pyobj_array = {0};
 
     if (PyRabbitMQ_Not_Connected(self))
         goto bail;
 
     if (!PyArg_ParseTuple(args, "IOI", &channel, &queue, &no_ack))
         goto bail;
-    if ((queue = Maybe_Unicode(queue)) == NULL) goto bail;
+    if ((queue = PyObjectArray_Maybe_Unicode(queue, &pyobj_array)) == NULL) goto bail;
 
     Py_BEGIN_ALLOW_THREADS;
     reply = amqp_basic_get(self->conn, channel,
                            PyString_AS_AMQBYTES(queue),
                            (amqp_boolean_t)no_ack);
+    PyObjectArray_XDECREF(&pyobj_array);
     Py_END_ALLOW_THREADS;
 
     if (PyRabbitMQ_HandleAMQError(self, channel, reply, "basic.get"))
@@ -2141,6 +2359,11 @@ PyRabbitMQ_Connection_basic_get(PyRabbitMQ_Connection *self,
                                  ok->exchange,
                                  ok->routing_key,
                                  ok->redelivered);
+    /* add in the message_count */
+    message_count = PyLong_FromLong(ok->message_count);
+    PyDict_SetItemString(delivery_info, "message_count", message_count);
+    Py_XDECREF(message_count);
+
     if (amqp_data_in_buffer(self->conn)) {
         if (PyRabbitMQ_recv(self, p, self->conn, 1) < 0) {
             if (!PyErr_Occurred())
@@ -2155,6 +2378,8 @@ PyRabbitMQ_Connection_basic_get(PyRabbitMQ_Connection *self,
 error:
     PyRabbitMQ_Connection_close(self);
 bail:
+    PyObjectArray_XDECREF(&pyobj_array);
+
     return 0;
 empty:
     Py_RETURN_NONE;
@@ -2167,24 +2392,56 @@ static PyMethodDef PyRabbitMQ_functions[] = {
     {NULL, NULL, 0, NULL}
 };
 
-PyMODINIT_FUNC init_librabbitmq(void)
+#if PY_MAJOR_VERSION >= 3
+    static struct PyModuleDef PyRabbitMQ_moduledef = {
+        PyModuleDef_HEAD_INIT,
+        PYRABBITMQ_MODULE_NAME,                /* m_name */
+        PYRABBITMQ_MODULE_DESC,                /* m_doc */
+        -1,                                    /* m_size */
+        PyRabbitMQ_functions,                  /* m_methods */
+        NULL,                                  /* m_reload */
+        NULL,                                  /* m_traverse */
+        NULL,                                  /* m_clear */
+        NULL,                                  /* m_free */
+    };
+#endif
+
+PYRABBITMQ_MOD_INIT(_librabbitmq)
 {
     PyObject *module, *socket_module;
 
     if (PyType_Ready(&PyRabbitMQ_ConnectionType) < 0) {
+    #if PY_MAJOR_VERSION >= 3
+        return NULL;
+    #else
         return;
+    #endif
     }
 
-    module = Py_InitModule3("_librabbitmq", PyRabbitMQ_functions,
-            "Hand-made wrapper for librabbitmq.");
+#if PY_MAJOR_VERSION >= 3
+    module = PyModule_Create(&PyRabbitMQ_moduledef);
+#else
+    module = Py_InitModule3(PYRABBITMQ_MODULE_NAME, PyRabbitMQ_functions,
+            PYRABBITMQ_MODULE_DESC);
+#endif
+
     if (module == NULL) {
+    #if PY_MAJOR_VERSION >= 3
+        return NULL;
+    #else
         return;
+    #endif
     }
 
     /* Get socket.error */
     socket_module = PyImport_ImportModule("socket");
-    if (!socket_module)
+    if (!socket_module) {
+    #if PY_MAJOR_VERSION >= 3
+        return NULL;
+    #else
         return;
+    #endif
+    }
     PyRabbitMQ_socket_timeout = PyObject_GetAttrString(socket_module, "timeout");
     Py_XDECREF(socket_module);
 
@@ -2206,5 +2463,9 @@ PyMODINIT_FUNC init_librabbitmq(void)
             "_librabbitmq.ChannelError", NULL, NULL);
     PyModule_AddObject(module, "ChannelError",
                        (PyObject *)PyRabbitMQExc_ChannelError);
+#if PY_MAJOR_VERSION >= 3
+    return module;
+#else
     return;
+#endif
 }

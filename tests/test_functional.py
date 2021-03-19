@@ -1,8 +1,10 @@
+# coding: utf-8
 from __future__ import absolute_import
-from __future__ import with_statement
+
+from six.moves import xrange
 
 import socket
-import unittest2 as unittest
+import unittest
 
 from librabbitmq import Message, Connection, ConnectionError, ChannelError
 TEST_QUEUE = 'pyrabbit.testq'
@@ -19,7 +21,8 @@ class test_Channel(unittest.TestCase):
 
     def test_send_message(self):
         message = Message(
-            'the quick brown fox jumps over the lazy dog',
+            channel=self.channel,
+            body='the quick brown fox jumps over the lazy dog',
             properties=dict(content_type='application/json',
                             content_encoding='utf-8'))
         self.channel.basic_publish(message, TEST_QUEUE, TEST_QUEUE)
@@ -28,6 +31,14 @@ class test_Channel(unittest.TestCase):
         self.assertGreater(self.channel.queue_purge(TEST_QUEUE), 2)
         self.channel.basic_publish(message, TEST_QUEUE, TEST_QUEUE)
         self.channel.basic_publish(message, TEST_QUEUE, TEST_QUEUE)
+
+    def test_nonascii_headers(self):
+        message = Message(
+            channel=self.channel,
+            body='the quick brown fox jumps over the lazy dog',
+            properties=dict(content_type='application/json',
+                            content_encoding='utf-8',
+                            headers={'key': r'¯\_(ツ)_/¯'}))
         self.channel.basic_publish(message, TEST_QUEUE, TEST_QUEUE)
 
     def _queue_declare(self):
@@ -40,7 +51,8 @@ class test_Channel(unittest.TestCase):
 
     def test_basic_get_ack(self):
         message = Message(
-            'the quick brown fox jumps over the lazy dog',
+            channel=self.channel,
+            body='the quick brown fox jumps over the lazy dog',
             properties=dict(content_type='application/json',
                             content_encoding='utf-8'))
         self.channel.basic_publish(message, TEST_QUEUE, TEST_QUEUE)
@@ -65,9 +77,11 @@ class test_Channel(unittest.TestCase):
         that we can fetch them with a timeout without needing to receive
         any more messages."""
 
-        message = Message('the quick brown fox jumps over the lazy dog',
-                          properties=dict(content_type='application/json',
-                                          content_encoding='utf-8'))
+        message = Message(
+            channel=self.channel,
+            body='the quick brown fox jumps over the lazy dog',
+            properties=dict(content_type='application/json',
+                            content_encoding='utf-8'))
 
         for i in xrange(100):
             self.channel.basic_publish(message, TEST_QUEUE, TEST_QUEUE)
@@ -82,14 +96,16 @@ class test_Channel(unittest.TestCase):
         for i in xrange(100):
             self.connection.drain_events(timeout=0.2)
 
-        self.assertEquals(len(messages), 100)
+        self.assertEqual(len(messages), 100)
 
     def test_timeout(self):
         """Check that our ``drain_events`` call actually times out if
         there are no messages."""
-        message = Message('the quick brown fox jumps over the lazy dog',
-                          properties=dict(content_type='application/json',
-                                          content_encoding='utf-8'))
+        message = Message(
+            channel=self.channel,
+            body='the quick brown fox jumps over the lazy dog',
+            properties=dict(content_type='application/json',
+                            content_encoding='utf-8'))
 
         self.channel.basic_publish(message, TEST_QUEUE, TEST_QUEUE)
 
@@ -104,7 +120,7 @@ class test_Channel(unittest.TestCase):
 
         with self.assertRaises(socket.timeout):
             self.connection.drain_events(timeout=0.1)
-        self.assertEquals(len(messages), 1)
+        self.assertEqual(len(messages), 1)
 
     def tearDown(self):
         if self.channel and self.connection.connected:
@@ -152,9 +168,11 @@ class test_Delete(unittest.TestCase):
         self.channel.queue_bind(self.TEST_QUEUE, self.TEST_QUEUE,
                                 self.TEST_QUEUE)
 
-        message = Message('the quick brown fox jumps over the lazy dog',
-                          properties=dict(content_type='application/json',
-                                          content_encoding='utf-8'))
+        message = Message(
+            channel=self.channel,
+            body='the quick brown fox jumps over the lazy dog',
+            properties=dict(content_type='application/json',
+                            content_encoding='utf-8'))
 
         self.channel.basic_publish(message, self.TEST_QUEUE, self.TEST_QUEUE)
 

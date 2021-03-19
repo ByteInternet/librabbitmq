@@ -1,6 +1,8 @@
 from __future__ import absolute_import
 
+import sys
 import itertools
+from six.moves import xrange
 
 import _librabbitmq
 
@@ -17,7 +19,7 @@ ConnectionError = _librabbitmq.ConnectionError
 ChannelError = _librabbitmq.ChannelError
 
 
-__version__ = '1.6.1'
+__version__ = '2.0.0'
 __all__ = ['Connection', 'Message', 'ConnectionError', 'ChannelError']
 
 
@@ -43,7 +45,10 @@ class Channel(object):
     def __init__(self, connection, channel_id):
         self.connection = connection
         self.channel_id = channel_id
-        self.next_consumer_tag = itertools.count(1).next
+        if sys.version_info.major == 2:
+            self.next_consumer_tag = itertools.count(1).next
+        else:
+            self.next_consumer_tag = itertools.count(1).__next__
         self.no_ack_consumers = set()
 
     def __enter__(self):
@@ -185,13 +190,15 @@ class Connection(_librabbitmq.Connection):
 
     def __init__(self, host='localhost', userid='guest', password='guest',
                  virtual_host='/', port=5672, channel_max=0xffff,
-                 frame_max=131072, heartbeat=0, lazy=False, **kwargs):
+                 frame_max=131072, heartbeat=0, lazy=False,
+                 client_properties=None, **kwargs):
         if ':' in host:
             host, port = host.split(':')
         super(Connection, self).__init__(
             hostname=host, port=int(port), userid=userid, password=password,
             virtual_host=virtual_host, channel_max=channel_max,
             frame_max=frame_max, heartbeat=heartbeat,
+            client_properties=client_properties,
         )
         self.channels = {}
         self._avail_channel_ids = array('H', xrange(self.channel_max, 0, -1))

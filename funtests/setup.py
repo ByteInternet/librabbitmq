@@ -41,11 +41,10 @@ setup(
     data_files=[],
     zip_safe=False,
     cmdclass={"install": no_install},
-    test_suite="nose.collector",
+    test_suite="tests",
     build_requires=[
         "nose",
         "nose-cover3",
-        "unittest2",
         "coverage>=3.0",
     ],
     classifiers=[

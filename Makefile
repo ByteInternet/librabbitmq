@@ -1,8 +1,6 @@
 # Building
 RABBIT_DIR=rabbitmq-c
-CODEGEN_DIR=rabbitmq-codegen
-RABBIT_TARGET=clib
-RABBIT_DIST=rabbitmq-c-0.5.3
+RABBIT_DIST=librabbitmq
 
 # Distribuition tools
 PYTHON=python
@@ -10,13 +8,11 @@ PYTHON=python
 all: build
 
 add-submodules:
-	-git submodule add https://github.com/ask/rabbitmq-c.git
-	-git submodule add https://github.com/rabbitmq/rabbitmq-codegen
+	-git submodule add -b v0.9.0 https://github.com/alanxz/rabbitmq-c.git
 
 submodules:
 	git submodule init
 	git submodule update
-	(cd $(RABBIT_DIR); rm -rf codegen; ln -sf ../$(CODEGEN_DIR) ./codegen)
 
 rabbitmq-c: submodules
 	(cd $(RABBIT_DIR); test -f configure || autoreconf -i)
@@ -24,27 +20,26 @@ rabbitmq-c: submodules
 
 
 rabbitmq-clean:
-	-(cd $(RABBIT_DIR) && make clean)
-	-(cd $(RABBIT_TARGET) && make clean)
+	-(rm -rf $(RABBIT_DIR)/build || true)
+	-(cd $(RABBIT_DIR) && make clean || echo "warning... rabbitmq-clean failed")
 
 rabbitmq-distclean:
-	-(cd $(RABBIT_DIR) && make distclean)
-	-(cd $(RABBIT_TARGET) && make distclean)
+	-(cd $(RABBIT_DIR) && make distclean || echo "warning... rabbitmq-distclean failed")
 
 clean-build:
 	-rm -rf build
 
 build: clean-build dist
-	python setup.py build
+	$(PYTHON) setup.py build
 
 install: build
-	python setup.py install
+	$(PYTHON) setup.py install
 
 develop: build
-	python setup.py develop
+	$(PYTHON) setup.py develop
 
 pyclean:
-	-python setup.py clean
+	-$(PYTHON) setup.py clean
 	-rm -rf build
 	-rm -f _librabbitmq.so
 
@@ -57,16 +52,17 @@ distclean: pyclean rabbitmq-distclean removepyc
 
 $(RABBIT_TARGET):
 	(test -f config.h || cd $(RABBIT_DIR); ./configure --disable-tools --disable-docs)
-	(cd $(RABBIT_DIR); make distdir)
-	mv "$(RABBIT_DIR)/$(RABBIT_DIST)" "$(RABBIT_TARGET)"
+	(cd $(RABBIT_DIR); make)
 
 
 dist: rabbitmq-c $(RABBIT_TARGET)
 
+manylinux1: dist
+	 docker run --rm -v `pwd`:/workspace:z quay.io/pypa/manylinux1_x86_64  /workspace/build-manylinux1-wheels.sh
 
 rebuild:
-	python setup.py build
-	python setup.py install
+	$(PYTHON) setup.py build
+	$(PYTHON) setup.py install
 
 
 # Distro tools
@@ -85,11 +81,12 @@ flakeplusdiag:
 
 flakes: flakediag flakeplusdiag
 
-test:
-	nosetests -xv librabbitmq.tests
+test: build
+	$(PYTHON) setup.py test
 
-cov:
-	nosetests -xv librabbitmq.tests --with-coverage --cover-html --cover-branch
+cov: build
+	coverage run --source=librabbitmq setup.py test
+	coverage report
 
 removepyc:
 	-find . -type f -a \( -name "*.pyc" -o -name "*$$py.class" \) | xargs rm

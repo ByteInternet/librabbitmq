@@ -5,10 +5,11 @@ from setuptools import setup, find_packages
 
 # --with-librabbitmq=<dir>: path to librabbitmq package if needed
 
-LRMQDIST = lambda *x: os.path.join('clib', *x)
+BASE_PATH = os.path.dirname(__file__)
+
+LRMQDIST = lambda *x: os.path.join(BASE_PATH, 'rabbitmq-c', *x)
 LRMQSRC = lambda *x: LRMQDIST('librabbitmq', *x)
-SPECPATH = lambda *x: os.path.join('rabbitmq-codegen', *x)
-PYCP = lambda *x: os.path.join('Modules', '_librabbitmq', *x)
+PYCP = lambda *x: os.path.join(BASE_PATH, 'Modules', '_librabbitmq', *x)
 
 
 def senv(*k__v, **kwargs):
@@ -17,25 +18,7 @@ def senv(*k__v, **kwargs):
     for k, v in k__v:
         prev = restore[k] = os.environ.get(k)
         os.environ[k] = (prev + sep if prev else '') + str(v)
-    return dict((k, v) for k, v in restore.iteritems() if v is not None)
-
-
-def codegen():
-    codegen = LRMQSRC('codegen.py')
-    spec = SPECPATH('amqp-rabbitmq-0.9.1.json')
-    sys.path.insert(0, SPECPATH())
-    commands = [
-        (sys.executable, codegen, 'header', spec, LRMQSRC('amqp_framing.h')),
-        (sys.executable, codegen, 'body', spec, LRMQSRC('amqp_framing.c')),
-    ]
-    restore = senv(('PYTHONPATH', SPECPATH()), sep=':')
-    try:
-        for command in commands:
-            print('- generating %r' % command[-1])
-            print(' '.join(command))
-            os.system(' '.join(command))
-    finally:
-        os.environ.update(restore)
+    return dict((k, v) for k, v in restore.items() if v is not None)
 
 
 def create_builder():
@@ -68,6 +51,10 @@ def create_builder():
     sys.argv[1:] = unprocessed
 
     incdirs.append(LRMQSRC())
+    if find_cmake() != "":
+        incdirs.append(LRMQDIST('build', 'librabbitmq'))
+
+
     PyC_files = map(PYCP, [
         'connection.c',
     ])
@@ -81,7 +68,7 @@ def create_builder():
         'amqp_socket.c',
         'amqp_table.c',
         'amqp_tcp_socket.c',
-        'amqp_timer.c',
+        'amqp_time.c',
         'amqp_url.c',
     ])
 
@@ -92,7 +79,7 @@ def create_builder():
 
     librabbitmq_ext = Extension(
         '_librabbitmq',
-        sources=PyC_files + librabbit_files,
+        sources=list(PyC_files) + list(librabbit_files),
         libraries=libs, include_dirs=incdirs,
         library_dirs=libdirs, define_macros=defs,
     )
@@ -123,6 +110,9 @@ def create_builder():
 
             here = os.path.abspath(os.getcwd())
             config = sysconfig.get_config_vars()
+            make = find_make()
+            cmake = find_cmake()
+
             try:
                 vars = {'ld': config['LDFLAGS'],
                         'c': config['CFLAGS']}
@@ -132,18 +122,46 @@ def create_builder():
                     vars[key] = vars[key].replace('-mno-fused-madd', '')
                     vars[key] = vars[key].replace(
                         '-isysroot /Developer/SDKs/MacOSX10.6.sdk', '')
-                    vars[key] = vars[key].replace('-Wall', '')
                 restore = senv(
                     ('CFLAGS', vars['c']),
                     ('LDFLAGS', vars['ld']),
                 )
+
                 try:
+                    if not os.path.isdir(os.path.join(LRMQDIST(), '.git')):
+                        print('- pull submodule rabbitmq-c...')
+                        if os.path.isfile('Makefile'):
+                            os.system(' '.join([make, 'submodules']))
+                        else:
+                            os.system(' '.join(['git', 'clone', '-b', 'v0.8.0',
+                                'https://github.com/alanxz/rabbitmq-c.git',
+                                'rabbitmq-c']))
+
                     os.chdir(LRMQDIST())
-                    if not os.path.isfile('config.h'):
+
+                    if cmake == "" and not os.path.isfile('configure'):
+                        print('- autoreconf')
+                        os.system('autoreconf -i')
+
+                    if cmake == "" and not os.path.isfile('config.h'):
                         print('- configure rabbitmq-c...')
                         if os.system('/bin/sh configure --disable-tools \
                                 --disable-docs --disable-dependency-tracking'):
                             return
+
+                    if cmake:
+                        print('- cmake rabbitmq-c...')
+                        if os.system('mkdir -p build'):
+                            return
+
+                        os.chdir('build')
+                        if not os.path.isfile('Makefile'):
+                            if os.system(cmake + ' ..'):
+                                return
+
+                        if os.system(make + ' rabbitmq rabbitmq-static'):
+                            return
+
                 finally:
                     os.environ.update(restore)
             finally:
@@ -151,7 +169,6 @@ def create_builder():
             restore = senv(
                 ('CFLAGS', ' '.join(self.stdcflags)),
             )
-            codegen()
             try:
                 _build.run(self)
             finally:
@@ -166,7 +183,22 @@ def find_make(alt=('gmake', 'gnumake', 'make', 'nmake')):
                 return make
 
 
-long_description = open('README.rst', 'U').read()
+def find_cmake():
+    for path in os.environ['PATH'].split(':'):
+        make = os.path.join(path, 'cmake')
+        if os.path.isfile(make):
+            return make
+
+    return ""
+
+
+if sys.version_info[0] < 3:
+    with open(os.path.join(BASE_PATH, 'README.rst'), 'U') as f:
+        long_description = f.read()
+else:
+    with open(os.path.join(BASE_PATH, 'README.rst')) as f:
+        long_description = f.read()
+
 distmeta = open(PYCP('distmeta.h')).read().strip().splitlines()
 distmeta = [item.split('\"')[1] for item in distmeta]
 version = distmeta[0].strip()
@@ -180,15 +212,14 @@ packages = []
 goahead = False
 is_jython = sys.platform.startswith('java')
 is_pypy = hasattr(sys, 'pypy_version_info')
-is_py3k = sys.version_info[0] == 3
 is_win = platform.system() == 'Windows'
 is_linux = platform.system() == 'Linux'
-if is_jython or is_pypy or is_py3k or is_win:
+if is_jython or is_pypy or is_win:
     pass
 elif find_make():
     try:
         librabbitmq_ext, build = create_builder()
-    except Exception, exc:
+    except Exception as exc:
         print('Could not create builder: %r' % (exc, ))
         raise
     else:
@@ -210,6 +241,26 @@ if 'install' in sys.argv and 'build' not in sys.argv:
         sys.argv[:_index] + ['build', 'install'] + sys.argv[_index + 1:]
     )
 
+# 'bdist_wheel doesn't always call build for some reason
+if 'bdist_wheel' in sys.argv and 'build' not in sys.argv:
+    _index = sys.argv.index('bdist_wheel')
+    sys.argv[:] = (
+        sys.argv[:_index] + ['build', 'bdist_wheel'] + sys.argv[_index + 1:]
+    )
+
+# 'bdist_egg doesn't always call build for some reason
+if 'bdist_egg' in sys.argv and 'build' not in sys.argv:
+    _index = sys.argv.index('bdist_egg')
+    sys.argv[:] = (
+        sys.argv[:_index] + ['build', 'bdist_egg'] + sys.argv[_index + 1:]
+    )
+
+# 'test doesn't always call build for some reason
+if 'test' in sys.argv and 'build' not in sys.argv:
+    _index = sys.argv.index('test')
+    sys.argv[:] = (
+        sys.argv[:_index] + ['build', 'test'] + sys.argv[_index + 1:]
+    )
 
 setup(
     name='librabbitmq',
@@ -220,12 +271,13 @@ setup(
     license='MPL',
     description='AMQP Client using the rabbitmq-c library.',
     long_description=long_description,
-    test_suite='nose.collector',
+    test_suite="tests",
     zip_safe=False,
     packages=packages,
     cmdclass=cmdclass,
     install_requires=[
         'amqp>=1.4.6',
+        'six>=1.0.0',
     ],
     ext_modules=ext_modules,
     classifiers=[
@@ -233,9 +285,10 @@ setup(
         'Operating System :: POSIX',
         'Operating System :: Microsoft :: Windows',
         'Programming Language :: C',
-        'Programming Language :: Python :: 2.5',
-        'Programming Language :: Python :: 2.6',
         'Programming Language :: Python :: 2.7',
+        'Programming Language :: Python :: 3.4',
+        'Programming Language :: Python :: 3.5',
+        'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: Implementation :: CPython',
         'Intended Audience :: Developers',
         'License :: OSI Approved :: Mozilla Public License 1.0 (MPL)',
